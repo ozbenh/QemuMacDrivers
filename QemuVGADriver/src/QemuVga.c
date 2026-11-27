@@ -73,6 +73,26 @@ static UInt32 ExtReadL(UInt32 reg)
 	return val;
 }
 
+static UInt32 PvmacReadL(UInt32 reg)
+{
+	volatile UInt32 *ptr;
+	UInt32 val;
+
+	ptr = (volatile UInt32 *)((UInt32)GLOBAL.boardRegAddress + PVMAC_BASE + reg);
+	val = EndianSwap32Bit(*ptr);
+	SynchronizeIO();
+	return val;
+}
+
+static void PvmacWriteL(UInt32 reg, UInt32 val)
+{
+	volatile UInt32 *ptr;
+
+	ptr = (volatile UInt32 *)((UInt32)GLOBAL.boardRegAddress + PVMAC_BASE + reg);
+	*ptr = EndianSwap32Bit(val);
+	SynchronizeIO();
+}
+
 static OSStatus VBLTimerProc(void *p1, void *p2);
 
 #ifndef USE_DSL_TIMER
@@ -163,6 +183,21 @@ OSStatus QemuVga_Init(void)
 	if (mem > GLOBAL.boardFBMappedSize)
 		mem = GLOBAL.boardFBMappedSize;
 	GLOBAL.vramSize = mem;
+
+	/* The PVMAC cursor slot lives at the top of VRAM: keep framebuffer
+	 * pages (and the mode list, which is sized from boardFBMappedSize)
+	 * below it. Must run before the mode list is built.
+	 */
+	if (QemuVga_ProbePvmac() && !GraphicsCoreAllocHardwareCursor()) {
+		lprintf("PVMAC: no memory for the cursor, disabled\n");
+		GLOBAL.hasHWCursor = false;
+	}
+	if (GLOBAL.hasHWCursor) {
+		if (GLOBAL.boardFBMappedSize > GLOBAL.cursorOffset)
+			GLOBAL.boardFBMappedSize = GLOBAL.cursorOffset;
+		if (GLOBAL.vramSize > GLOBAL.cursorOffset)
+			GLOBAL.vramSize = GLOBAL.cursorOffset;
+	}
 	
 	// XXX Add endian control regs
 
@@ -385,4 +420,50 @@ OSStatus QemuVga_Blank(Boolean blank)
 	}
 	GLOBAL.blanked = blank;
 	return noErr;
+}
+
+/************************ PVMAC hardware cursor ****************************/
+
+Boolean QemuVga_ProbePvmac(void)
+{
+	UInt32 offset;
+
+	GLOBAL.hasHWCursor = false;
+	if (GLOBAL.boardRegMappedSize < PVMAC_BASE + PVMAC_REG_CUR_OFFSET + 4)
+		return false;
+	if (PvmacReadL(PVMAC_REG_ID) != PVMAC_ID_VALUE)
+		return false;
+	if (!(PvmacReadL(PVMAC_REG_CAPS) & PVMAC_CAP_HWCURSOR))
+		return false;
+	offset = PvmacReadL(PVMAC_REG_CUR_OFFSET);
+	if (offset < 0x10000 || offset + 0x4000 > GLOBAL.boardFBMappedSize)
+		return false;
+	GLOBAL.cursorOffset = offset;
+	GLOBAL.hasHWCursor = true;
+	PvmacWriteL(PVMAC_REG_CUR_CTRL, 0);
+	lprintf("PVMAC v%d: hardware cursor, slot at %08lX\n",
+			PvmacReadL(PVMAC_REG_VERSION), offset);
+	return true;
+}
+
+UInt32 *QemuVga_CursorSlot(void)
+{
+	return (UInt32 *)(FB_START + GLOBAL.cursorOffset);
+}
+
+/* The 32x32 ARGB image must already be in the cursor slot. */
+Boolean QemuVga_CursorDefine(UInt32 hotX, UInt32 hotY)
+{
+	SynchronizeIO();	/* image stores before the doorbell */
+	PvmacWriteL(PVMAC_REG_CUR_SIZE, PVMAC_CURSOR_EDGE);
+	PvmacWriteL(PVMAC_REG_CUR_HOT, (hotY << 16) | (hotX & 0xffff));
+	PvmacWriteL(PVMAC_REG_CUR_DEFINE, 1);
+	return (PvmacReadL(PVMAC_REG_STATUS) & PVMAC_STATUS_ERROR) == 0;
+}
+
+/* x, y: hotspot position on screen */
+void QemuVga_CursorMove(SInt32 x, SInt32 y, Boolean visible)
+{
+	PvmacWriteL(PVMAC_REG_CUR_POS, ((UInt32)(y & 0xffff) << 16) | (x & 0xffff));
+	PvmacWriteL(PVMAC_REG_CUR_CTRL, visible ? 1 : 0);
 }

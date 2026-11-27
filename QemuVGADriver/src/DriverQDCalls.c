@@ -201,18 +201,70 @@ GraphicsCoreGetGray(VDGrayRecord *grayRecord)
 }
 
 /************************ Hardware Cursor ****************************/
+/*
+ * Backed by the PVMAC extension of QEMU's VGA ("mac-accel=on"); without it
+ * the driver reports no hardware cursor, exactly as before.
+ *
+ * The conversion follows the approach of elliotnunn/classicvirtio's removed
+ * virtio-gpu driver (device-gpu.c, MIT): VSLPrepareCursorForHardwareCursor
+ * renders the cursor as 32-bit CLUT indices plus two special encodings,
+ * which we turn into ARGB for the host.
+ *
+ * The NDRV interface passes the cursor's top-left corner only. The host
+ * draws the cursor at the real pointer position, so it needs the hotspot:
+ * we take it as (low-memory Mouse - top-left) on the first draw after a new
+ * cursor image.
+ */
+
+#define CURSOR_TRANSPARENT	0x80000000UL
+#define CURSOR_INVERT		0x40000000UL
+#define CURSOR_CLUT_SIZE	256
+#define LM_MOUSE			((volatile Point *)0x0830)	/* low-memory Mouse */
+
+struct CursorColorTable {
+	long		ctSeed;
+	short		ctFlags;
+	short		ctSize;
+	ColorSpec	ctTable[CURSOR_CLUT_SIZE];
+};
+
+/*
+ * No system-heap memory for the cursor: Mac OS 9 startup is fragile to any
+ * extra system-heap use by the driver (+7 KB made "Apple Audio Extension"
+ * crash in 3 of 4 boots, see PLAN.md F10). The 16 KiB PVMAC cursor slot in
+ * VRAM only needs its first 4 KiB for the 32x32 ARGB image the host reads,
+ * so the conversion buffers live in the rest of the slot.
+ */
+#define SLOT_INDICES_OFFSET		0x2000	/* 4 KiB: VSLPrepare output (indices) */
+#define SLOT_CLUT_OFFSET		0x3000	/* 2056 bytes: colour table */
+#define SLOT_ENCODINGS_OFFSET	0x3900	/* 1 KiB: colour encodings */
+
+static struct CursorColorTable	*gCursorCLUT;
+static UInt32					*gCursorEncodings;
+static UInt32					*gCursorPixels;
+
+Boolean
+GraphicsCoreAllocHardwareCursor(void)
+{
+	char *slot = (char *)QemuVga_CursorSlot();
+
+	gCursorPixels = (UInt32 *)(slot + SLOT_INDICES_OFFSET);
+	gCursorCLUT = (struct CursorColorTable *)(slot + SLOT_CLUT_OFFSET);
+	gCursorEncodings = (UInt32 *)(slot + SLOT_ENCODINGS_OFFSET);
+	return true;
+}
 
 OSStatus
 GraphicsCoreSupportsHardwareCursor(VDSupportsHardwareCursorRec *hwCursRec)
 {
 	CHECK_OPEN( statusErr );
-		
+
 	Trace(GraphicsCoreSupportsHardwareCursor);
 
 	hwCursRec->csReserved1 = 0;
 	hwCursRec->csReserved2 = 0;
 
-	hwCursRec->csSupportsHardwareCursor = false;
+	hwCursRec->csSupportsHardwareCursor = GLOBAL.hasHWCursor;
 
 	return noErr;
 }
@@ -220,17 +272,112 @@ GraphicsCoreSupportsHardwareCursor(VDSupportsHardwareCursorRec *hwCursRec)
 OSStatus
 GraphicsCoreSetHardwareCursor(VDSetHardwareCursorRec *setHwCursRec)
 {
+	HardwareCursorDescriptorRec desc;
+	HardwareCursorInfoRec info;
+	UInt32 *slot;
+	UInt32 x, y, w, h, i;
+
 	Trace(GraphicsCoreSetHardwareCursor);
 
-	return controlErr;
+	GLOBAL.cursorSet = false;
+	if (!GLOBAL.hasHWCursor || !gCursorPixels)
+		return controlErr;
+
+	for (i = 0; i < CURSOR_CLUT_SIZE; i++)
+		gCursorEncodings[i] = i;
+
+	BlockZero(&desc, sizeof(desc));
+	desc.majorVersion = kHardwareCursorDescriptorMajorVersion;
+	desc.minorVersion = kHardwareCursorDescriptorMinorVersion;
+	desc.height = PVMAC_CURSOR_EDGE;
+	desc.width = PVMAC_CURSOR_EDGE;
+	desc.bitDepth = 32;
+	desc.numColors = CURSOR_CLUT_SIZE;
+	desc.colorEncodings = gCursorEncodings;
+	desc.supportedSpecialEncodings = kTransparentEncodedPixel | kInvertingEncodedPixel;
+	desc.specialEncodings[kTransparentEncoding] = CURSOR_TRANSPARENT;
+	desc.specialEncodings[kInvertingEncoding] = CURSOR_INVERT;
+
+	BlockZero(&info, sizeof(info));
+	info.majorVersion = kHardwareCursorInfoMajorVersion;
+	info.minorVersion = kHardwareCursorInfoMinorVersion;
+	info.colorMap = (CTabPtr)gCursorCLUT;
+	info.hardwareCursor = (Ptr)gCursorPixels;
+
+	if (!VSLPrepareCursorForHardwareCursor(setHwCursRec->csCursorRef, &desc, &info))
+		return controlErr;
+
+	w = info.cursorWidth;
+	h = info.cursorHeight;
+	if (w > PVMAC_CURSOR_EDGE || h > PVMAC_CURSOR_EDGE)
+		return controlErr;
+
+	/* gCursorPixels is w pixels wide; the slot is always 32x32 ARGB
+	 * (A,R,G,B byte order, i.e. a native big-endian 0xAARRGGBB word).
+	 * Inverting pixels cannot be expressed in ARGB: draw them black.
+	 */
+	slot = QemuVga_CursorSlot();
+	for (y = 0; y < PVMAC_CURSOR_EDGE; y++) {
+		for (x = 0; x < PVMAC_CURSOR_EDGE; x++) {
+			UInt32 argb = 0;	/* transparent */
+
+			if (x < w && y < h) {
+				UInt32 p = gCursorPixels[y * w + x];
+
+				if (p == CURSOR_INVERT) {
+					argb = 0xff000000UL;
+				} else if (p != CURSOR_TRANSPARENT && p < CURSOR_CLUT_SIZE) {
+					RGBColor *c = &gCursorCLUT->ctTable[p].rgb;
+
+					argb = 0xff000000UL |
+						   ((UInt32)(c->red >> 8) << 16) |
+						   ((UInt32)(c->green >> 8) << 8) |
+						   (UInt32)(c->blue >> 8);
+				}
+			}
+			slot[y * PVMAC_CURSOR_EDGE + x] = argb;
+		}
+	}
+
+	/* Hotspot is unknown until the next DrawHardwareCursor */
+	GLOBAL.cursorHotPending = true;
+	GLOBAL.cursorSet = true;
+	return noErr;
 }
 
 OSStatus
 GraphicsCoreDrawHardwareCursor(VDDrawHardwareCursorRec *drawHwCursRec)
 {
+	static UInt32 hotX, hotY;
+
 	Trace(GraphicsCoreDrawHardwareCursor);
 
-	return controlErr;
+	if (!GLOBAL.cursorSet)
+		return controlErr;
+
+	GLOBAL.cursorX = drawHwCursRec->csCursorX;
+	GLOBAL.cursorY = drawHwCursRec->csCursorY;
+	GLOBAL.cursorVisible = drawHwCursRec->csCursorVisible ? true : false;
+
+	if (GLOBAL.cursorHotPending) {
+		Point m = *LM_MOUSE;
+		SInt32 hx = m.h - GLOBAL.cursorX;
+		SInt32 hy = m.v - GLOBAL.cursorY;
+
+		if (hx >= 0 && hx < PVMAC_CURSOR_EDGE && hy >= 0 && hy < PVMAC_CURSOR_EDGE) {
+			hotX = hx;
+			hotY = hy;
+		}
+		if (!QemuVga_CursorDefine(hotX, hotY)) {
+			GLOBAL.cursorSet = false;
+			return controlErr;
+		}
+		GLOBAL.cursorHotPending = false;
+	}
+
+	QemuVga_CursorMove(GLOBAL.cursorX + hotX, GLOBAL.cursorY + hotY,
+					   GLOBAL.cursorVisible);
+	return noErr;
 }
 
 OSStatus
@@ -238,7 +385,16 @@ GraphicsCoreGetHardwareCursorDrawState(VDHardwareCursorDrawStateRec *hwCursDStat
 {
 	Trace(GraphicsCoreGetHardwareCursorDrawState);
 
-	return statusErr;
+	if (!GLOBAL.hasHWCursor)
+		return statusErr;
+
+	hwCursDStateRec->csCursorX = GLOBAL.cursorX;
+	hwCursDStateRec->csCursorY = GLOBAL.cursorY;
+	hwCursDStateRec->csCursorVisible = GLOBAL.cursorVisible;
+	hwCursDStateRec->csCursorSet = GLOBAL.cursorSet;
+	hwCursDStateRec->csReserved1 = 0;
+	hwCursDStateRec->csReserved2 = 0;
+	return noErr;
 }
 
 /************************ Misc ****************************/
