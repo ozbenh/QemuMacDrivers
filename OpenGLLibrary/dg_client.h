@@ -112,6 +112,10 @@ struct DGPacket {
 	int failed,valid_reply,oom;
 	unsigned char inline_data[DG_INLINE_BYTES];
 };
+/* dg_trace.c: one-frame diagnostic trace (see dg_trace.c) */
+void DGTraceMessage(const struct DGPacket *p);
+void DGTraceFrame(void);
+void DGTraceDump(void);
 
 /* Value bits of a scalar argument, zero-extended like VIM's DGBits on a
  * little-endian client (a GLint -1 is 0x00000000ffffffff). Floats and doubles

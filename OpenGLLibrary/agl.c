@@ -343,6 +343,7 @@ static GLboolean Impl_aglDestroyContext(AGLContext ctx)
 {
 	struct DGReply reply;
 
+	DGTraceDump();
 	if (!ctx)
 		return SetError(AGL_BAD_CONTEXT);
 	Unlink(ctx);
@@ -1143,6 +1144,7 @@ static int Present(struct __AGLContextRec *c)
 
 static void Impl_aglSwapBuffers(AGLContext ctx)
 {
+	DGTraceFrame();
 	if (!ctx || !ctx->port || !ctx->drawable) {
 		SetError(ctx ? AGL_BAD_DRAWABLE : AGL_BAD_CONTEXT);
 		return;

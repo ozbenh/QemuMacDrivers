@@ -9,7 +9,7 @@ if(NOT EXISTS ${GEN}/OpenGLLibrary.exp)
 endif()
 
 add_library(OpenGLLibrary SHARED
-  dg_client.c dg_arrays.c dg_extra.c dg_transport.c dg_log.c agl.c glcustom.c ${GEN}/gl_generated.c ${GEN}/gl_dispatch.c)
+  dg_client.c dg_arrays.c dg_extra.c dg_transport.c dg_log.c dg_trace.c agl.c glcustom.c ${GEN}/gl_generated.c ${GEN}/gl_dispatch.c)
 target_include_directories(OpenGLLibrary PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${GEN})
 # -fno-strict-aliasing: payload bytes are reinterpreted. min-pagesize=0 and
 # no null-pointer check deletion: classic Mac OS has valid low memory.

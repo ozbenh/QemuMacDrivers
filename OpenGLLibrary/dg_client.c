@@ -333,6 +333,7 @@ int DGSubmitHeader(struct DGContext *context, struct DGPacket *p, struct DGReply
 		return -1;
 	}
 	p->message.flags |= DG_REPLY;
+	DGTraceMessage(p);
 	DGCompactFlush();
 	PutHeader(head, &p->message);
 	send = (p->message.flags & DG_OUTPUT_ONLY) ? 0 : p->message.bytes;
@@ -404,6 +405,7 @@ struct DGReply DGSubmit(struct DGContext *context, struct DGPacket *p, int sync)
 		}
 		return reply;
 	}
+	DGTraceMessage(p);
 	if (CompactAppend(&p->message))
 		return reply;
 	DGCompactFlush();
