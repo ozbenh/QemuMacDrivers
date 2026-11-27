@@ -143,3 +143,102 @@ jobs:
             GLHello/build/GLHello.bin
             GLHello/build/GLHello.dsk
             GLHello/glhello_gen.h
+
+  # Client encoder for the OS 9 OpenGLLibrary. Runs VirtualIntelMac's generator
+  # (MIT, pinned) three times: unpatched, patched without the flag (must be
+  # byte-identical to unpatched), and patched with VIM_GEN_ELEMENT_WIDTH=1,
+  # which emits the per-payload element width a big-endian guest needs.
+  opengl-codegen:
+    runs-on: xcode-27
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch VirtualIntelMac (pinned) and the 10.9 SDK
+        env:
+          VIM_COMMIT: 2861da9e265e557aef90319e4451487ed1fed553   # VirtualIntelMac 2.2
+          SDK_URL: https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX10.9.sdk.tar.xz
+          SDK_SHA256: fcf88ce8ff0dd3248b97f4eb81c7909f2cc786725de277f4d05a2b935cc49de0
+        run: |
+          set -e
+          git clone -q --filter=blob:none --no-checkout https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon.git "$RUNNER_TEMP/vim"
+          git -C "$RUNNER_TEMP/vim" checkout -q "$VIM_COMMIT" -- Source/scripts Source/PassthroughOpenGL
+          curl -sfL -o "$RUNNER_TEMP/sdk.tar.xz" "$SDK_URL"
+          echo "$SDK_SHA256  $RUNNER_TEMP/sdk.tar.xz" | shasum -a 256 -c -
+          tar -xf "$RUNNER_TEMP/sdk.tar.xz" -C "$RUNNER_TEMP"
+
+      - name: Generate with the unpatched generator
+        run: |
+          set -e
+          python3 -I "$RUNNER_TEMP/vim/Source/scripts/generate-passthrough-opengl.py" \
+            "$RUNNER_TEMP/MacOSX10.9.sdk" "$RUNNER_TEMP/gen-orig" | tee "$RUNNER_TEMP/orig.log"
+
+      - name: Apply vim-ppc-element-width.patch (must apply cleanly)
+        run: |
+          set -e
+          git -C "$RUNNER_TEMP/vim" apply --check "$GITHUB_WORKSPACE/OpenGLLibrary/vim/vim-ppc-element-width.patch"
+          git -C "$RUNNER_TEMP/vim" apply "$GITHUB_WORKSPACE/OpenGLLibrary/vim/vim-ppc-element-width.patch"
+
+      - name: Generate patched, flag unset, and prove byte-identity
+        run: |
+          set -e
+          G="$RUNNER_TEMP/vim/Source/scripts/generate-passthrough-opengl.py"
+          python3 -I "$G" "$RUNNER_TEMP/MacOSX10.9.sdk" "$RUNNER_TEMP/gen-default" | tee "$RUNNER_TEMP/default.log"
+          diff -r "$RUNNER_TEMP/gen-orig" "$RUNNER_TEMP/gen-default"
+          diff "$RUNNER_TEMP/orig.log" "$RUNNER_TEMP/default.log"
+          echo "flag unset: output byte-identical to the unpatched generator ($(ls "$RUNNER_TEMP/gen-orig" | wc -l | tr -d ' ') files)"
+
+      - name: Generate patched with VIM_GEN_ELEMENT_WIDTH=1
+        run: |
+          set -e
+          G="$RUNNER_TEMP/vim/Source/scripts/generate-passthrough-opengl.py"
+          VIM_GEN_ELEMENT_WIDTH=1 python3 -I "$G" "$RUNNER_TEMP/MacOSX10.9.sdk" "$RUNNER_TEMP/gen-ppc" \
+            > "$RUNNER_TEMP/ppc.log" 2> "$RUNNER_TEMP/ppc.err"
+          cat "$RUNNER_TEMP/ppc.log" "$RUNNER_TEMP/ppc.err"
+          # Only the client encoder may differ from the unpatched output; the
+          # rest of the flagged output must be unchanged plus the two new files.
+          diff -rq "$RUNNER_TEMP/gen-orig" "$RUNNER_TEMP/gen-ppc" | sort > "$RUNNER_TEMP/ppc.diff" || true
+          cat "$RUNNER_TEMP/ppc.diff"
+          test "$(wc -l < "$RUNNER_TEMP/ppc.diff" | tr -d ' ')" = 3
+          grep -q 'direct-client-generated.inc differ' "$RUNNER_TEMP/ppc.diff"
+          grep -q 'Only in .*direct-element-width.inc' "$RUNNER_TEMP/ppc.diff"
+          grep -q 'Only in .*opengl-codegen-ppc.json' "$RUNNER_TEMP/ppc.diff"
+          # Every payload helper call must now be a W variant.
+          if grep -E '\bDG(PacketPointer|PacketOutput|PacketQueryInput|PackEvaluatorPoints|PacketIncludeString|PacketCopy)\(' "$RUNNER_TEMP/gen-ppc/direct-client-generated.inc"; then echo "unwidened payload call left"; exit 1; fi
+          echo "W calls: $(grep -oE 'DG(PacketPointer|PacketOutput|PacketQueryInput|PackEvaluatorPoints|PacketIncludeString|PacketCopy)W\(' "$RUNNER_TEMP/gen-ppc/direct-client-generated.inc" | wc -l | tr -d ' ')"
+          grep -E 'void glLoadMatrixf|DGPacketPointerW\(&packet,0,m' "$RUNNER_TEMP/gen-ppc/direct-client-generated.inc" | head -3 || true
+          grep -E 'DGPacketPointerW.*pixels' "$RUNNER_TEMP/gen-ppc/direct-client-generated.inc" | head -3 || true
+
+      - name: Collect
+        run: |
+          set -e
+          O="$RUNNER_TEMP/codegen-out"
+          mkdir -p "$O/ppc" "$O/original"
+          for f in direct-client-generated.inc direct-opcodes.h direct-layout.h direct-lookup.inc direct-declarations.inc \
+                   direct-element-width.inc opengl-codegen-ppc.json passthrough-opengl-gli-map.json direct-coverage.json; do
+            cp "$RUNNER_TEMP/gen-ppc/$f" "$O/ppc/$f"
+          done
+          for f in direct-client-generated.inc direct-opcodes.h direct-layout.h direct-lookup.inc direct-declarations.inc \
+                   passthrough-opengl-gli-map.json; do
+            cp "$RUNNER_TEMP/gen-orig/$f" "$O/original/$f"
+          done
+          # Inputs of the OS 9 library build (job opengl-library): the get-count
+          # tables, VIM's two query-count includes (MIT) and the GL enum numbers.
+          cp "$RUNNER_TEMP/gen-ppc/direct-get-counts.inc" "$O/ppc/"
+          for f in server-state-query-counts.inc additional-state-query-counts.inc; do
+            cp "$RUNNER_TEMP/vim/Source/PassthroughOpenGL/$f" "$O/ppc/$f"
+          done
+          python3 -I "$GITHUB_WORKSPACE/OpenGLLibrary/gen-glenums.py" "$RUNNER_TEMP/MacOSX10.9.sdk" "$O/ppc/glenum-values.h"
+          cp "$GITHUB_WORKSPACE/OpenGLLibrary/vim/vim-ppc-element-width.patch" "$O/"
+          cp "$RUNNER_TEMP/ppc.err" "$O/generator-ppc.stderr.txt"
+          cp "$RUNNER_TEMP/ppc.diff" "$O/flagged-vs-original.diff.txt"
+          ls -lR "$O"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opengl-codegen-ppc
+          path: ${{ runner.temp }}/codegen-out

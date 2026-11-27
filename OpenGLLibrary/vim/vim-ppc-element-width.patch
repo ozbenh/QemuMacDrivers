@@ -1,0 +1,210 @@
+--- a/Source/scripts/generate-passthrough-opengl.py	2026-11-24 23:28:02
++++ b/Source/scripts/generate-passthrough-opengl.py	2026-11-24 23:28:33
+@@ -8,13 +8,19 @@
+ import argparse
+ import hashlib
+ import json
++import os
+ import pathlib
+ import re
++import sys
+ 
+ p = argparse.ArgumentParser(description=__doc__)
+ p.add_argument("sdk", type=pathlib.Path)
+ p.add_argument("output", type=pathlib.Path)
+ a = p.parse_args()
++# PPC-guest element-width mode (OS 9 3D port, MIT, see QemuMacDrivers
++# OpenGLLibrary/vim). Off by default: with the variable unset every output file
++# is byte-identical to the unpatched generator.
++ELEMENT_WIDTH = os.environ.get("VIM_GEN_ELEMENT_WIDTH") == "1"
+ h = a.sdk / "System/Library/Frameworks/OpenGL.framework/Headers"
+ text = re.sub(r"/\*.*?\*/", "", (h / "gliDispatch.h").read_text(), flags=re.S)
+ rows = re.findall(r"([^;{}]+?)\(\s*\*(\w+)\)\s*\((.*?)\)\s*;", text, re.S)
+@@ -517,8 +523,116 @@
+     return None
+ 
+ 
++# ---- PPC element-width mode (only used when VIM_GEN_ELEMENT_WIDTH=1) --------
++# A big-endian guest must write pointer payloads little-endian. The encoder
++# therefore needs the element width (1, 2, 4 or 8 bytes; 0 = opaque) of every
++# pointer payload. Typed elements are resolved here at generation time; GLvoid
++# pixel data resolves at run time from the slot's GL type enum argument.
++ELEMENT_BYTES = {}
++for _w, _names in {
++        1: "GLbyte GLubyte GLboolean GLchar GLcharARB",
++        2: "GLshort GLushort GLhalf GLhalfARB GLhalfNV",
++        4: "GLint GLuint GLenum GLsizei GLbitfield GLfloat GLclampf GLfixed GLhandleARB",
++        8: "GLdouble GLclampd GLint64 GLuint64 GLint64EXT GLuint64EXT"}.items():
++    for _n in _names.split():
++        ELEMENT_BYTES[_n] = _w
++OPAQUE_ELEMENTS = {"void", "GLvoid"}
++# Public client helpers that move a payload, and the position of their
++# wire-slot argument. Each gets a W variant taking the element width last.
++WIDTH_CALLS = {"DGPacketPointer": 1, "DGPacketOutput": 2, "DGPacketQueryInput": 1,
++               "DGPackEvaluatorPoints": 2, "DGPacketIncludeString": 1, "DGPacketCopy": 1}
++WIDTH_CALL_PATTERN = re.compile(r"\b(" + "|".join(WIDTH_CALLS) + r")\(")
++ppc_unresolved = []
++
++def element_width(field, arg, element, parsed):
++    """C expression for the payload element width in bytes (0 = opaque)."""
++    if element in ELEMENT_BYTES:
++        return str(ELEMENT_BYTES[element])
++    if element in OPAQUE_ELEMENTS:
++        if field.startswith("compressed_tex") or field in {"program_binary", "get_program_binary", "shader_binary"}:
++            return "1"  # compressed texture / program binaries are byte streams
++        if any(t == "GLenum" and n == "type" for t, n in parsed):
++            return "DGGLTypeWidth(type)"  # pixels, call_lists: width follows the GL type enum
++        return "0"  # e.g. BufferData: contents are application-defined
++    ppc_unresolved.append(f"{field}.{arg}: {element}")
++    return "0"
++
++def widen_client_function(lines, widths, field):
++    """Add the element width to every payload helper call of one generated client function."""
++    out = []
++    for line in lines:
++        pos, text = 0, ""
++        while True:
++            m = WIDTH_CALL_PATTERN.search(line, pos)
++            if not m:
++                out.append(text + line[pos:])
++                break
++            depth, j, start, args = 1, m.end(), m.end(), []
++            while j < len(line):
++                c = line[j]
++                if c in "([{":
++                    depth += 1
++                elif c in ")]}":
++                    depth -= 1
++                    if depth == 0:
++                        break
++                elif c == "," and depth == 1:
++                    args.append(line[start:j]);start = j + 1
++                j += 1
++            if depth:
++                raise SystemExit(f"unbalanced {m[1]} call in {field}: {line}")
++            args.append(line[start:j])
++            slot = int(args[WIDTH_CALLS[m[1]]].strip())
++            if slot not in widths:
++                ppc_unresolved.append(f"{field}: no width for wire slot {slot}")
++            text += line[pos:m.start()] + m[1] + "W(" + ",".join(args) + "," + widths.get(slot, "0") + ")"
++            pos = j + 1
++    return out
++
++
++ELEMENT_WIDTH_INC = r"""/* Generated element-width contract for a big-endian guest (MIT, derived from
++ * VirtualIntelMac's generate-passthrough-opengl.py; see QemuMacDrivers
++ * OpenGLLibrary/vim/vim-ppc-element-width.patch).
++ *
++ * With VIM_GEN_ELEMENT_WIDTH=1 the generated client calls these helpers; each
++ * is the original VIM helper plus a trailing `width`: the element size in bytes
++ * of the payload (1, 2, 4, 8; 0 = opaque, copy verbatim). The transport must
++ * store/reload payload elements little-endian (swap per `width` on a BE guest).
++ *
++ *   DGPacketPointerW(p,index,pointer,bytes,output,width)
++ *   DGPacketOutputW(p,context,index,pointer,bytes,width)
++ *   DGPacketQueryInputW(p,index,pointer,bytes,width)
++ *   DGPackEvaluatorPointsW(context,p,index,pointer,...,width)
++ *   DGPacketIncludeStringW(p,index,string,length,width)
++ *   DGPacketCopyW(p,index,pointer,bytes,width)   reply data back to the caller
++ */
++#include <stddef.h>
++/* Element width in bytes of pixel/list data of a given GL type enum. */
++static inline unsigned DGGLTypeWidth(unsigned type)
++{
++    switch(type) {
++    case 0x1400: case 0x1401: case 0x1A00:               /* BYTE UNSIGNED_BYTE BITMAP */
++    case 0x1407: case 0x1408: case 0x1409:               /* 2/3/4_BYTES: byte-order defined */
++    case 0x8032: case 0x8362:                            /* UNSIGNED_BYTE_3_3_2, _2_3_3_REV */
++        return 1;
++    case 0x1402: case 0x1403: case 0x140B:               /* SHORT UNSIGNED_SHORT HALF_FLOAT */
++    case 0x8033: case 0x8034: case 0x8363: case 0x8364:  /* 4_4_4_4 5_5_5_1 5_6_5 5_6_5_REV */
++    case 0x8365: case 0x8366: case 0x85BA: case 0x85BB:  /* 4_4_4_4_REV 1_5_5_5_REV SHORT_8_8(_REV)_APPLE */
++        return 2;
++    case 0x1404: case 0x1405: case 0x1406:               /* INT UNSIGNED_INT FLOAT */
++    case 0x8035: case 0x8036: case 0x8367: case 0x8368:  /* 8_8_8_8 10_10_10_2 (+_REV) 2_10_10_10_REV */
++    case 0x84FA: case 0x8C3B: case 0x8C3E:               /* 24_8 10F_11F_11F_REV 5_9_9_9_REV */
++    case 0x8DAD:                                         /* FLOAT_32_UNSIGNED_INT_24_8_REV (two 4-byte units) */
++        return 4;
++    case 0x140A: return 8;                               /* DOUBLE */
++    default: return 0;                                   /* unknown: opaque */
++    }
++}
++"""
++
+ client, host, decl, mapping, report = [], [], [], [], []
+ gli_map = []
++ppc_slots, ppc_funcs = {}, []
+ emitted = set()
+ for index, (ret, field, parameters) in enumerate(rows):
+     ret = " ".join(ret.split())
+@@ -564,6 +678,19 @@
+             # in both headers, but they only consume the values.
+             shapes[arg] = (size, element, "const" not in typ and
+                            not (field in integer_texture_fields and field.startswith("tex_")))
++    if ELEMENT_WIDTH:
++        ppc_widths, ppc_params = {}, []
++        for i, (typ, arg) in enumerate(parsed):
++            entry = dict(type=typ, name=arg, pointer="*" in typ)
++            if "*" in typ:
++                element = typ.replace("const", "").replace("*", "").strip()
++                entry["width"] = ppc_widths[i] = element_width(field, arg, element, parsed) if typ.count("*") == 1 else "0"
++                entry["const"] = "const" in typ
++                entry["output"] = bool(arg in shapes and shapes[arg][2])
++                entry["bytes_expr"] = shapes[arg][0] if arg in shapes else None
++            ppc_params.append(entry)
++        ppc_slots[index] = dict(opcode=index, gli_field=field, gl_name=name, return_type=ret,
++                                signature=signature, params=ppc_params, widths=ppc_widths, state="no-gl-name" if not name else "pending")
+     # Output arrays with an explicit API count/capacity must reach native GL
+     # even when that signed count is zero/negative. Bound positive storage;
+     # never inspect an unused caller array merely to marshal an error call.
+@@ -607,6 +734,8 @@
+     if field in array_calls:
+         supported = True
+     report.append(dict(slot=index, field=field, symbol=name, supported=bool(supported)))
++    if ELEMENT_WIDTH and name:
++        ppc_slots[index].update(supported=bool(report[-1]["supported"]), state="alias-duplicate" if name in emitted else "pending")
+     if not name:
+         continue
+     if name in emitted:
+@@ -618,7 +747,12 @@
+                 "glGetBufferParameteriv", "glGetBufferParameteri64v", "glGetBufferSubData", "glCopyBufferSubData",
+                 "glMapBuffer", "glMapBufferRange", "glGetBufferPointerv", "glUnmapBuffer", "glFlushMappedBufferRange", "glFlushMappedBufferRangeAPPLE"}:
+         report[-1]["supported"] = True
++        if ELEMENT_WIDTH:
++            ppc_slots[index].update(supported=True, state="custom-client")
+         continue  # bounded string reply and local transport errors are custom
++    if ELEMENT_WIDTH:
++        ppc_funcs.append((len(client), index))
++        ppc_slots[index]["state"] = "generated"
+     client.append(f"{ret} {name}({signature}) {{")
+     client.append("    struct DGContext *context=dg_current;")
+     # Measured period command semantics, not an OS-wide change to normalized
+@@ -1662,6 +1796,16 @@
+         host.append("    reply->result=DGBits(&result,sizeof(result));")
+     host += ["    return 0;", "}"]
+ 
++if ELEMENT_WIDTH:
++    # Rewrite each generated client function so every payload helper call
++    # carries its element width (…W variants; see direct-element-width.inc).
++    bounds = [s for s, _ in ppc_funcs] + [len(client)]
++    widened = client[:bounds[0]] if ppc_funcs else list(client)
++    for (start, index), end in zip(ppc_funcs, bounds[1:]):
++        widened += widen_client_function(client[start:end], ppc_slots[index]["widths"], rows[index][1])
++    client = widened
++    if ppc_unresolved:
++        print("element-width: UNRESOLVED " + "; ".join(sorted(set(ppc_unresolved))), file=sys.stderr)
+ digest = hashlib.sha256(text.encode()).hexdigest()
+ a.output.mkdir(parents=True, exist_ok=True)
+ for filename, lines in [("direct-client-generated.inc", client), ("direct-host-generated.inc", host),
+@@ -1796,4 +1940,11 @@
+     limits.pop(value, None)
+ (a.output / "direct-get-counts.inc").write_text("\n".join(
+     f"case 0x{value:x}: return 1; /* {name} */" for value, name in sorted(limits.items())) + "\n")
++if ELEMENT_WIDTH:
++    (a.output / "direct-element-width.inc").write_text(ELEMENT_WIDTH_INC)
++    for slot in ppc_slots.values():
++        slot["widths"] = {str(k): v for k, v in slot["widths"].items()}
++    (a.output / "opengl-codegen-ppc.json").write_text(json.dumps(
++        dict(layout=digest, element_width_mode=True, unresolved=sorted(set(ppc_unresolved)),
++             slots=[ppc_slots[i] for i in sorted(ppc_slots)]), indent=2) + "\n")
+ print(f"PassthroughOpenGL: {sum(r['supported'] for r in report)} supported / {len(rows)} GLI slots; SDK {digest[:12]}")
