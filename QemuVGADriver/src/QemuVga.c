@@ -186,15 +186,24 @@ OSStatus QemuVga_Init(void)
 	 * pages (and the mode list, which is sized from boardFBMappedSize)
 	 * below it. Must run before the mode list is built.
 	 */
+	GLOBAL.fbMappedFullSize = GLOBAL.boardFBMappedSize;
 	if (QemuVga_ProbePvmac() && !GraphicsCoreAllocHardwareCursor()) {
 		lprintf("PVMAC: no memory for the cursor, disabled\n");
 		GLOBAL.hasHWCursor = false;
 	}
 	if (GLOBAL.hasHWCursor) {
-		if (GLOBAL.boardFBMappedSize > GLOBAL.cursorOffset)
-			GLOBAL.boardFBMappedSize = GLOBAL.cursorOffset;
-		if (GLOBAL.vramSize > GLOBAL.cursorOffset)
-			GLOBAL.vramSize = GLOBAL.cursorOffset;
+		/* PVMAC v2 keeps the GL command ring and reply area below the
+		 * cursor slot: keep the framebuffer (and the mode list) below them too. */
+		UInt32 limit = GLOBAL.cursorOffset;
+		if (PvmacReadL(PVMAC_REG_CAPS) & PVMAC_CAP_GL_STREAM) {
+			UInt32 ring = PvmacReadL(PVMAC_REG_RING_OFFSET);
+			if (ring >= 0x10000 && ring < limit)
+				limit = ring;
+		}
+		if (GLOBAL.boardFBMappedSize > limit)
+			GLOBAL.boardFBMappedSize = limit;
+		if (GLOBAL.vramSize > limit)
+			GLOBAL.vramSize = limit;
 	}
 	
 	// XXX Add endian control regs
@@ -439,6 +448,43 @@ Boolean QemuVga_ProbePvmac(void)
 	lprintf("PVMAC v%d: hardware cursor, slot at %08lX\n",
 			PvmacReadL(PVMAC_REG_VERSION), offset);
 	return true;
+}
+
+OSStatus QemuVga_GetPvmacInfo(PvmacInfo *info)
+{
+	UInt32 ringOff, ringSize, replyOff, replySize;
+
+	if (info == NULL)
+		return paramErr;
+	info->version = info->caps = info->regBase = info->vramBase = 0;
+	info->ringOffset = info->ringSize = 0;
+	info->replyOffset = info->replySize = 0;
+
+	if (GLOBAL.boardRegMappedSize < PVMAC_BASE + PVMAC_REG_CUR_OFFSET + 4 ||
+		PvmacReadL(PVMAC_REG_ID) != PVMAC_ID_VALUE)
+		return noErr;
+	info->version = PvmacReadL(PVMAC_REG_VERSION);
+	info->caps = PvmacReadL(PVMAC_REG_CAPS);
+	info->regBase = (UInt32)GLOBAL.boardRegAddress + PVMAC_BASE;
+	info->vramBase = (UInt32)GLOBAL.boardFBAddress;
+	if (info->version < 2 || !(info->caps & PVMAC_CAP_GL_STREAM) ||
+		GLOBAL.boardRegMappedSize < PVMAC_BASE + PVMAC_REG_REPLY_EXPECT + 4)
+		return noErr;
+
+	ringOff = PvmacReadL(PVMAC_REG_RING_OFFSET);
+	ringSize = PvmacReadL(PVMAC_REG_RING_SIZE);
+	replyOff = PvmacReadL(PVMAC_REG_REPLY_OFFSET);
+	replySize = PvmacReadL(PVMAC_REG_REPLY_SIZE);
+	if (ringOff + ringSize < ringOff || ringOff + ringSize > GLOBAL.fbMappedFullSize ||
+		replyOff + replySize < replyOff || replyOff + replySize > GLOBAL.fbMappedFullSize) {
+		lprintf("PVMAC GL ring outside the mapped VRAM, not reported\n");
+		return noErr;
+	}
+	info->ringOffset = ringOff;
+	info->ringSize = ringSize;
+	info->replyOffset = replyOff;
+	info->replySize = replySize;
+	return noErr;
 }
 
 UInt32 *QemuVga_CursorSlot(void)

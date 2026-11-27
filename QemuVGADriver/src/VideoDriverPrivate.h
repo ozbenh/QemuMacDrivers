@@ -61,6 +61,7 @@ struct DriverGlobal {
 	Boolean				isOpen;
 	
 	UInt32				vramSize;
+	UInt32				fbMappedFullSize;	/* BAR mapping before PVMAC reservations */
 	UInt32				depth;
 	UInt32				bootDepth;
 	UInt32				bootMode;

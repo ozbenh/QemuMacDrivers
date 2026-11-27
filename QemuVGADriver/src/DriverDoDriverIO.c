@@ -511,6 +511,9 @@ DriverStatusCmd( IOCommandID ioCommandID, IOCommandKind ioCommandKind, CntrlPara
 	case cscGetPowerState:
 		status = GraphicsCoreGetPowerState((VDPowerStateRec *) genericPtr);
 		break;
+	case PVMAC_CS_GET_INFO:
+		status = QemuVga_GetPvmacInfo((PvmacInfo *) genericPtr);
+		break;
 	case cscGetClutBehavior:
 		*(VDClutBehaviorPtr)genericPtr = kSetClutAtSetEntries;
 		status = noErr;
