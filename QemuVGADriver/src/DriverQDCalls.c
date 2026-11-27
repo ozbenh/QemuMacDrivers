@@ -703,7 +703,7 @@ GraphicsCoreGetNextResolution(VDResolutionInfoRec *resInfo)
 	resInfo->csDisplayModeID	= id;
 	resInfo->csHorizontalPixels	= width;
 	resInfo->csVerticalLines	= height;
-	resInfo->csRefreshRate		= 60;
+	resInfo->csRefreshRate		= 60L << 16;	/* Fixed */
 	resInfo->csMaxDepthMode		= MAX_DEPTH_MODE; /* XXX Calculate if it fits ! */
 
 	return noErr;
