@@ -69,6 +69,15 @@ struct DriverGlobal {
 	UInt32				curPage;
 	LogicalAddress		curBaseAddress;
 	Boolean				blanked;
+
+	/* PVMAC hardware cursor (QEMU "mac-accel"), see QemuVga.h */
+	Boolean				hasHWCursor;		/* device offers it */
+	Boolean				cursorSet;			/* last SetHardwareCursor succeeded */
+	Boolean				cursorVisible;
+	Boolean				cursorHotPending;	/* new image: hotspot not sent yet */
+	SInt32				cursorX;			/* top-left, from DrawHardwareCursor */
+	SInt32				cursorY;
+	UInt32				cursorOffset;		/* VRAM offset of the cursor slot */
 };
 typedef struct DriverGlobal DriverGlobal, *DriverGlobalPtr;
 

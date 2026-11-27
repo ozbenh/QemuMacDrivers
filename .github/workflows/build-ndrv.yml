@@ -1,0 +1,52 @@
+name: Build qemu_vga.ndrv (Retro68)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Apple's Universal Interfaces & Libraries 3.x (with AppleDouble resource
+      # forks for the PPC shared-library stubs), pinned to the commit of
+      # brunocastello/iWordle that added them.
+      - name: Checkout Universal Interfaces
+        uses: actions/checkout@v4
+        with:
+          repository: brunocastello/iWordle
+          ref: 7483dbeddd5d8c9d73bb362c24ad70ce5d6d7f45
+          path: sdk
+          sparse-checkout: third_party/InterfacesAndLibraries
+
+      - name: Build with Retro68
+        run: |
+          docker pull -q ghcr.io/autc04/retro68
+          echo "Retro68 image: $(docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/autc04/retro68)"
+          docker run --rm -v "$PWD:/src" -w /src/QemuVGADriver -i ghcr.io/autc04/retro68 /bin/bash <<'EOF'
+          set -e
+          /Retro68-build/bin/interfaces-and-libraries.sh /Retro68-build/toolchain /src/sdk/third_party/InterfacesAndLibraries
+          powerpc-apple-macos-gcc --version | head -1
+          make
+          ls -l build
+          EOF
+
+      - name: Inspect output
+        run: |
+          f=QemuVGADriver/build/qemu_vga.ndrv
+          ls -l "$f" builds/qemu_vga.ndrv
+          echo "PEF header:"; xxd -l 64 "$f"
+          for s in DoDriverIO TheDriverDescription; do
+            grep -q "$s" "$f" && echo "export string present: $s" || { echo "::error::missing $s"; exit 1; }
+          done
+          sha256sum "$f"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu_vga.ndrv
+          path: QemuVGADriver/build/qemu_vga.ndrv
