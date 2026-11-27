@@ -12,8 +12,6 @@
  * TRACE_RECORD bytes, all big-endian as the guest stores them:
  *   u32 op, u32 payload bytes, u64 args[0..7] (host values before the LE
  *   header encoding), first 12 payload bytes, u32 host context id.
- *   (Older description follows:)
- *   header encoding), first 16 payload bytes (wire = little-endian order).
  */
 #include <MacTypes.h>
 #include <Files.h>

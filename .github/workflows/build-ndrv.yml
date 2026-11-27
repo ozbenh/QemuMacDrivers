@@ -56,7 +56,7 @@ jobs:
   # as UTM/guest-kit/intel/build-mojave-kit.sh does. Runs on macOS; the Retro68
   # job below only consumes the small generated header.
   glhello-header:
-    runs-on: xcode-27
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -149,7 +149,7 @@ jobs:
   # byte-identical to unpatched), and patched with VIM_GEN_ELEMENT_WIDTH=1,
   # which emits the per-payload element width a big-endian guest needs.
   opengl-codegen:
-    runs-on: xcode-27
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
