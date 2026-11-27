@@ -166,10 +166,8 @@ static InterruptMemberNumber PCIInterruptHandler(InterruptSetMember ISTmember,
 
 OSStatus QemuVga_Init(void)
 {
-	UInt16 id, i;
-	UInt32 mem, width, height, depth;
-	Boolean modeFound = false;
-	struct vMode *v;
+	UInt16 id;
+	UInt32 mem, width, height, depth, i;
 
 	lprintf("First MMIO read...\n");
 	id = DispiReadW(VBE_DISPI_INDEX_ID);
@@ -207,21 +205,18 @@ OSStatus QemuVga_Init(void)
 	lprintf("Current setting: %dx%dx%d\n", width, height, depth);
 
 	GLOBAL.depth = GLOBAL.bootDepth = depth;
-	GLOBAL.numModes = QemuVga_ReadEdidModes();
+	GLOBAL.numModes = QemuVga_InitModes();
 	lprintf("Number of modes: %d\n", GLOBAL.numModes);
 
-	for (i = 0, v = vModes; v != NULL; v = v->next, i++) {
-		if (width == v->mode->width && height == v->mode->height) {
-		    modeFound = true;
-			break;
-		}
-	}
-
-	if (!modeFound) {
-		lprintf("Not found in list ! using default.\n");
-		i = 0;
+	/* Boot in the resolution QEMU was started with (-g), if we have it */
+	i = QemuVga_FindMode(width, height);
+	if (i == kQvNoMode) {
+		i = QemuVga_FindMode(1024, 768);
+		if (i == kQvNoMode)
+			i = QemuVga_NextMode(kQvNoMode);
+		lprintf("Not found in list ! using mode ID %d.\n", i + 1);
 	} else {
-	    lprintf("Using mode: %d\n", i);
+		lprintf("Using mode ID %d\n", i + 1);
 	}
 	GLOBAL.bootMode = i;
 
@@ -342,12 +337,12 @@ OSStatus QemuVga_GetColorEntry(UInt32 index, RGBColor *color)
 
 OSStatus QemuVga_GetModeInfo(UInt32 index, UInt32 *width, UInt32 *height)
 {
-	if (index >= GLOBAL.numModes)
+	if (!QemuVga_ModeAvailable(index))
 		return paramErr;
 	if (width)
-		*width = getVMode(index)->width;
+		*width = qvModes[index].width;
 	if (height)
-		*height = getVMode(index)->height;
+		*height = qvModes[index].height;
 	return noErr;
 }
 
@@ -356,10 +351,10 @@ OSStatus QemuVga_GetModePages(UInt32 index, UInt32 depth,
 {
 	UInt32 width, height, pBytes;
 
-	if (index >= GLOBAL.numModes)
+	if (!QemuVga_ModeAvailable(index))
 		return paramErr;
-	width = getVMode(index)->width;
-	height = getVMode(index)->height;
+	width = qvModes[index].width;
+	height = qvModes[index].height;
 	pBytes = width * ((depth + 7) / 8) * height;
 	if (pageSize)
 		*pageSize = pBytes;
@@ -377,11 +372,11 @@ OSStatus QemuVga_SetMode(UInt32 mode, UInt32 depth, UInt32 page)
 	UInt32 width, height;
 	UInt32 pageSize, numPages;
 
-	if (mode >= GLOBAL.numModes)
+	if (!QemuVga_ModeAvailable(mode))
 		return paramErr;
 	
-	width = getVMode(mode)->width;
-	height = getVMode(mode)->height;
+	width = qvModes[mode].width;
+	height = qvModes[mode].height;
 	QemuVga_GetModePages(mode, depth, &pageSize, &numPages);
 	lprintf("Set Mode: %dx%dx%d has %d pages\n", width, height, depth, numPages);
 	if (page >= numPages)

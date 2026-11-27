@@ -45,21 +45,20 @@
 #define VBE_DISPI_LFB_ENABLED            0x40
 #define VBE_DISPI_NOCLEARMEM             0x80
 
-/* --- VModes */
+/* --- VModes (fixed table, see QemuEdid.c; mode ID = index + 1) */
 
 struct _vMode {
-    UInt32 width;
-    UInt32 height;
+    UInt16 width;
+    UInt16 height;
 };
 
-struct vMode {
-    struct vMode *next;
-    struct _vMode *mode;
-};
+#define kQvNoMode                        0xffffffffUL
 
-extern struct vMode *vModes;
-extern struct _vMode defaultVModes[];
-extern struct _vMode *getVMode(UInt16 idx);
+extern const struct _vMode qvModes[];
+extern UInt32 QemuVga_NumModeIDs(void);
+extern Boolean QemuVga_ModeAvailable(UInt32 index);
+extern UInt32 QemuVga_NextMode(UInt32 prevIndex);
+extern UInt32 QemuVga_FindMode(UInt32 width, UInt32 height);
 
 /* --- PVMAC paravirtual extension (QEMU "VGA,mac-accel=on") ---
  * 32-bit little-endian registers at BAR2 + 0x800; see QEMU
@@ -93,7 +92,7 @@ extern OSStatus	QemuVga_Close();
 extern void QemuVga_EnableInterrupts(void);
 extern void QemuVga_DisableInterrupts(void);
 
-extern UInt16 QemuVga_ReadEdidModes(void);
+extern UInt16 QemuVga_InitModes(void);
 
 extern OSStatus	QemuVga_SetDepth(UInt32 bpp);
 

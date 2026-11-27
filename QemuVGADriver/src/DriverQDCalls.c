@@ -604,7 +604,8 @@ GraphicsCoreGetModeTiming(VDTimingInfoRec *timingInfo)
 
 	CHECK_OPEN( statusErr );
 
-	if (timingInfo->csTimingMode < 1 || timingInfo->csTimingMode > GLOBAL.numModes )
+	if (timingInfo->csTimingMode < 1 ||
+	    !QemuVga_ModeAvailable(timingInfo->csTimingMode - 1))
 		return paramErr;
 	
 	timingInfo->csTimingFlags	=
@@ -674,27 +675,29 @@ GraphicsCoreSwitchMode(VDSwitchInfoRec *switchInfo)
 OSStatus
 GraphicsCoreGetNextResolution(VDResolutionInfoRec *resInfo)
 {
-	UInt32 width, height;
-	int id = resInfo->csPreviousDisplayModeID;
+	UInt32 width, height, next;
+	SInt32 id = resInfo->csPreviousDisplayModeID;
 
 	Trace(GraphicsCoreGetNextResolution);
 
 	CHECK_OPEN(statusErr);
 
+	/* IDs are fixed (see QemuEdid.c); walk the modes in size order */
 	if (id == kDisplayModeIDFindFirstResolution)
-		id = 0;
+		next = QemuVga_NextMode(kQvNoMode);
 	else if (id == kDisplayModeIDCurrent)
-		id = GLOBAL.curMode;
-	id++;
-	
-	if (id == GLOBAL.numModes + 1) {
+		next = GLOBAL.curMode;	/* means "the current mode itself" */
+	else if (id >= 1 && QemuVga_ModeAvailable(id - 1))
+		next = QemuVga_NextMode(id - 1);
+	else
+		return paramErr;
+
+	if (next == kQvNoMode) {
 		resInfo->csDisplayModeID = kDisplayModeIDNoMoreResolutions;
 		return noErr;
 	}
-	if (id < 1 || id > GLOBAL.numModes)
-		return paramErr;
-	
-	if (QemuVga_GetModeInfo(id - 1, &width, &height))
+	id = next + 1;
+	if (QemuVga_GetModeInfo(next, &width, &height))
 		return paramErr;
 
 	resInfo->csDisplayModeID	= id;
@@ -717,7 +720,8 @@ GraphicsCoreGetVideoParams(VDVideoParametersInfoRec *videoParams)
 
 	CHECK_OPEN(statusErr);
  		
-	if (videoParams->csDisplayModeID < 1 || videoParams->csDisplayModeID > GLOBAL.numModes)
+	if (videoParams->csDisplayModeID < 1 ||
+	    !QemuVga_ModeAvailable(videoParams->csDisplayModeID - 1))
 		return paramErr;
 	if (videoParams->csDepthMode > MAX_DEPTH_MODE)
 		return paramErr;
