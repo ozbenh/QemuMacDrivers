@@ -45,21 +45,68 @@
 #define VBE_DISPI_LFB_ENABLED            0x40
 #define VBE_DISPI_NOCLEARMEM             0x80
 
-/* --- VModes */
+/* --- VModes (fixed table, see QemuEdid.c; mode ID = index + 1) */
 
 struct _vMode {
-    UInt32 width;
-    UInt32 height;
+    UInt16 width;
+    UInt16 height;
 };
 
-struct vMode {
-    struct vMode *next;
-    struct _vMode *mode;
-};
+#define kQvNoMode                        0xffffffffUL
 
-extern struct vMode *vModes;
-extern struct _vMode defaultVModes[];
-extern struct _vMode *getVMode(UInt16 idx);
+extern const struct _vMode qvModes[];
+extern UInt32 QemuVga_NumModeIDs(void);
+extern Boolean QemuVga_ModeAvailable(UInt32 index);
+extern UInt32 QemuVga_NextMode(UInt32 prevIndex);
+extern UInt32 QemuVga_FindMode(UInt32 width, UInt32 height);
+
+/* --- PVMAC paravirtual extension (QEMU "VGA,mac-accel=on") ---
+ * 32-bit little-endian registers at BAR2 + 0x800; see QEMU
+ * docs/specs/standard-vga.rst. Absent on stock QEMU: ID reads 0 or ~0.
+ */
+#define PVMAC_BASE                       0x800
+#define PVMAC_REG_ID                     0x00
+#define PVMAC_REG_VERSION                0x04
+#define PVMAC_REG_CAPS                   0x08
+#define PVMAC_REG_STATUS                 0x0c
+#define PVMAC_REG_CUR_CTRL               0x10
+#define PVMAC_REG_CUR_POS                0x14
+#define PVMAC_REG_CUR_HOT                0x18
+#define PVMAC_REG_CUR_SIZE               0x1c
+#define PVMAC_REG_CUR_DEFINE             0x20
+#define PVMAC_REG_CUR_OFFSET             0x24
+/* version 2: GL stream ring (CAPS bit 1) */
+#define PVMAC_REG_RING_OFFSET            0x28
+#define PVMAC_REG_RING_SIZE              0x2c
+#define PVMAC_REG_REPLY_OFFSET           0x38
+#define PVMAC_REG_REPLY_SIZE             0x3c
+#define PVMAC_REG_REPLY_EXPECT           0x4c    /* last v2 register */
+
+#define PVMAC_ID_VALUE                   0x50564d43  /* 'PVMC' */
+#define PVMAC_CAP_HWCURSOR               0x00000001
+#define PVMAC_CAP_GL_STREAM              0x00000002
+#define PVMAC_STATUS_ERROR               0x00000002
+#define PVMAC_CURSOR_EDGE                32          /* we always define 32x32 */
+
+/* Private Status csCode (PBStatus on the display driver): csParam holds a
+ * pointer to a PvmacInfo, as for the standard video codes. Not an Apple video
+ * csCode; 0x8300 as a signed short. Lets a guest library (OpenGL/RAVE) find
+ * the PVMAC registers and the GL stream ring without its own PCI access.
+ * With PVMAC v1 or none: version is filled (0 if absent), the rest is 0.
+ * All fields are native (big-endian) UInt32; offsets are bytes into VRAM.
+ */
+#define PVMAC_CS_GET_INFO                ((short)0x8300)
+
+typedef struct PvmacInfo {
+	UInt32	version;		/* PVMAC VERSION register, 0 = no PVMAC */
+	UInt32	caps;			/* CAPS register */
+	UInt32	regBase;		/* logical address of the PVMAC registers (LE) */
+	UInt32	vramBase;		/* logical address of VRAM offset 0 */
+	UInt32	ringOffset;		/* command ring, VRAM offset */
+	UInt32	ringSize;
+	UInt32	replyOffset;	/* reply area, VRAM offset */
+	UInt32	replySize;
+} PvmacInfo;
 
 /* --- Internal APIs */
 
@@ -72,7 +119,7 @@ extern OSStatus	QemuVga_Close();
 extern void QemuVga_EnableInterrupts(void);
 extern void QemuVga_DisableInterrupts(void);
 
-extern UInt16 QemuVga_ReadEdidModes(void);
+extern UInt16 QemuVga_InitModes(void);
 
 extern OSStatus	QemuVga_SetDepth(UInt32 bpp);
 
@@ -85,5 +132,12 @@ extern OSStatus QemuVga_GetModeInfo(UInt32 index, UInt32 *width, UInt32 *height)
 extern OSStatus QemuVga_SetMode(UInt32 modeIndex, UInt32 depth, UInt32 page);
 
 extern OSStatus QemuVga_Blank(Boolean blank);
+
+extern Boolean QemuVga_ProbePvmac(void);
+extern OSStatus QemuVga_GetPvmacInfo(PvmacInfo *info);
+extern UInt32 *QemuVga_CursorSlot(void);
+extern Boolean QemuVga_CursorDefine(UInt32 hotX, UInt32 hotY);
+extern void QemuVga_CursorMove(SInt32 x, SInt32 y, Boolean visible);
+extern Boolean GraphicsCoreAllocHardwareCursor(void);
 
 #endif

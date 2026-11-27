@@ -73,6 +73,26 @@ static UInt32 ExtReadL(UInt32 reg)
 	return val;
 }
 
+static UInt32 PvmacReadL(UInt32 reg)
+{
+	volatile UInt32 *ptr;
+	UInt32 val;
+
+	ptr = (volatile UInt32 *)((UInt32)GLOBAL.boardRegAddress + PVMAC_BASE + reg);
+	val = EndianSwap32Bit(*ptr);
+	SynchronizeIO();
+	return val;
+}
+
+static void PvmacWriteL(UInt32 reg, UInt32 val)
+{
+	volatile UInt32 *ptr;
+
+	ptr = (volatile UInt32 *)((UInt32)GLOBAL.boardRegAddress + PVMAC_BASE + reg);
+	*ptr = EndianSwap32Bit(val);
+	SynchronizeIO();
+}
+
 static OSStatus VBLTimerProc(void *p1, void *p2);
 
 #ifndef USE_DSL_TIMER
@@ -124,6 +144,7 @@ static OSStatus VBLTimerProc(void *p1, void *p2)
 	ScheduleVBLTimer();
 
 	GLOBAL.inInterrupt = 0;
+	return noErr;
 }
 
 #ifdef USE_PCI_IRQ
@@ -145,10 +166,8 @@ static InterruptMemberNumber PCIInterruptHandler(InterruptSetMember ISTmember,
 
 OSStatus QemuVga_Init(void)
 {
-	UInt16 id, i;
-	UInt32 mem, width, height, depth;
-	Boolean modeFound = false;
-	struct vMode *v;
+	UInt16 id;
+	UInt32 mem, width, height, depth, i;
 
 	lprintf("First MMIO read...\n");
 	id = DispiReadW(VBE_DISPI_INDEX_ID);
@@ -162,6 +181,30 @@ OSStatus QemuVga_Init(void)
 	if (mem > GLOBAL.boardFBMappedSize)
 		mem = GLOBAL.boardFBMappedSize;
 	GLOBAL.vramSize = mem;
+
+	/* The PVMAC cursor slot lives at the top of VRAM: keep framebuffer
+	 * pages (and the mode list, which is sized from boardFBMappedSize)
+	 * below it. Must run before the mode list is built.
+	 */
+	GLOBAL.fbMappedFullSize = GLOBAL.boardFBMappedSize;
+	if (QemuVga_ProbePvmac() && !GraphicsCoreAllocHardwareCursor()) {
+		lprintf("PVMAC: no memory for the cursor, disabled\n");
+		GLOBAL.hasHWCursor = false;
+	}
+	if (GLOBAL.hasHWCursor) {
+		/* PVMAC v2 keeps the GL command ring and reply area below the
+		 * cursor slot: keep the framebuffer (and the mode list) below them too. */
+		UInt32 limit = GLOBAL.cursorOffset;
+		if (PvmacReadL(PVMAC_REG_CAPS) & PVMAC_CAP_GL_STREAM) {
+			UInt32 ring = PvmacReadL(PVMAC_REG_RING_OFFSET);
+			if (ring >= 0x10000 && ring < limit)
+				limit = ring;
+		}
+		if (GLOBAL.boardFBMappedSize > limit)
+			GLOBAL.boardFBMappedSize = limit;
+		if (GLOBAL.vramSize > limit)
+			GLOBAL.vramSize = limit;
+	}
 	
 	// XXX Add endian control regs
 
@@ -171,21 +214,18 @@ OSStatus QemuVga_Init(void)
 	lprintf("Current setting: %dx%dx%d\n", width, height, depth);
 
 	GLOBAL.depth = GLOBAL.bootDepth = depth;
-	GLOBAL.numModes = QemuVga_ReadEdidModes();
+	GLOBAL.numModes = QemuVga_InitModes();
 	lprintf("Number of modes: %d\n", GLOBAL.numModes);
 
-	for (i = 0, v = vModes; v != NULL; v = v->next, i++) {
-		if (width == v->mode->width && height == v->mode->height) {
-		    modeFound = true;
-			break;
-		}
-	}
-
-	if (!modeFound) {
-		lprintf("Not found in list ! using default.\n");
-		i = 0;
+	/* Boot in the resolution QEMU was started with (-g), if we have it */
+	i = QemuVga_FindMode(width, height);
+	if (i == kQvNoMode) {
+		i = QemuVga_FindMode(1024, 768);
+		if (i == kQvNoMode)
+			i = QemuVga_NextMode(kQvNoMode);
+		lprintf("Not found in list ! using mode ID %d.\n", i + 1);
 	} else {
-	    lprintf("Using mode: %d\n", i);
+		lprintf("Using mode ID %d\n", i + 1);
 	}
 	GLOBAL.bootMode = i;
 
@@ -306,12 +346,12 @@ OSStatus QemuVga_GetColorEntry(UInt32 index, RGBColor *color)
 
 OSStatus QemuVga_GetModeInfo(UInt32 index, UInt32 *width, UInt32 *height)
 {
-	if (index >= GLOBAL.numModes)
+	if (!QemuVga_ModeAvailable(index))
 		return paramErr;
 	if (width)
-		*width = getVMode(index)->width;
+		*width = qvModes[index].width;
 	if (height)
-		*height = getVMode(index)->height;
+		*height = qvModes[index].height;
 	return noErr;
 }
 
@@ -320,10 +360,10 @@ OSStatus QemuVga_GetModePages(UInt32 index, UInt32 depth,
 {
 	UInt32 width, height, pBytes;
 
-	if (index >= GLOBAL.numModes)
+	if (!QemuVga_ModeAvailable(index))
 		return paramErr;
-	width = getVMode(index)->width;
-	height = getVMode(index)->height;
+	width = qvModes[index].width;
+	height = qvModes[index].height;
 	pBytes = width * ((depth + 7) / 8) * height;
 	if (pageSize)
 		*pageSize = pBytes;
@@ -341,11 +381,11 @@ OSStatus QemuVga_SetMode(UInt32 mode, UInt32 depth, UInt32 page)
 	UInt32 width, height;
 	UInt32 pageSize, numPages;
 
-	if (mode >= GLOBAL.numModes)
+	if (!QemuVga_ModeAvailable(mode))
 		return paramErr;
 	
-	width = getVMode(mode)->width;
-	height = getVMode(mode)->height;
+	width = qvModes[mode].width;
+	height = qvModes[mode].height;
 	QemuVga_GetModePages(mode, depth, &pageSize, &numPages);
 	lprintf("Set Mode: %dx%dx%d has %d pages\n", width, height, depth, numPages);
 	if (page >= numPages)
@@ -383,4 +423,88 @@ OSStatus QemuVga_Blank(Boolean blank)
 		VgaWriteB(0x3c0, 0x3f);
 	}
 	GLOBAL.blanked = blank;
+	return noErr;
+}
+
+/************************ PVMAC hardware cursor ****************************/
+
+Boolean QemuVga_ProbePvmac(void)
+{
+	UInt32 offset;
+
+	GLOBAL.hasHWCursor = false;
+	if (GLOBAL.boardRegMappedSize < PVMAC_BASE + PVMAC_REG_CUR_OFFSET + 4)
+		return false;
+	if (PvmacReadL(PVMAC_REG_ID) != PVMAC_ID_VALUE)
+		return false;
+	if (!(PvmacReadL(PVMAC_REG_CAPS) & PVMAC_CAP_HWCURSOR))
+		return false;
+	offset = PvmacReadL(PVMAC_REG_CUR_OFFSET);
+	if (offset < 0x10000 || offset + 0x4000 > GLOBAL.boardFBMappedSize)
+		return false;
+	GLOBAL.cursorOffset = offset;
+	GLOBAL.hasHWCursor = true;
+	PvmacWriteL(PVMAC_REG_CUR_CTRL, 0);
+	lprintf("PVMAC v%d: hardware cursor, slot at %08lX\n",
+			PvmacReadL(PVMAC_REG_VERSION), offset);
+	return true;
+}
+
+OSStatus QemuVga_GetPvmacInfo(PvmacInfo *info)
+{
+	UInt32 ringOff, ringSize, replyOff, replySize;
+
+	if (info == NULL)
+		return paramErr;
+	info->version = info->caps = info->regBase = info->vramBase = 0;
+	info->ringOffset = info->ringSize = 0;
+	info->replyOffset = info->replySize = 0;
+
+	if (GLOBAL.boardRegMappedSize < PVMAC_BASE + PVMAC_REG_CUR_OFFSET + 4 ||
+		PvmacReadL(PVMAC_REG_ID) != PVMAC_ID_VALUE)
+		return noErr;
+	info->version = PvmacReadL(PVMAC_REG_VERSION);
+	info->caps = PvmacReadL(PVMAC_REG_CAPS);
+	info->regBase = (UInt32)GLOBAL.boardRegAddress + PVMAC_BASE;
+	info->vramBase = (UInt32)GLOBAL.boardFBAddress;
+	if (info->version < 2 || !(info->caps & PVMAC_CAP_GL_STREAM) ||
+		GLOBAL.boardRegMappedSize < PVMAC_BASE + PVMAC_REG_REPLY_EXPECT + 4)
+		return noErr;
+
+	ringOff = PvmacReadL(PVMAC_REG_RING_OFFSET);
+	ringSize = PvmacReadL(PVMAC_REG_RING_SIZE);
+	replyOff = PvmacReadL(PVMAC_REG_REPLY_OFFSET);
+	replySize = PvmacReadL(PVMAC_REG_REPLY_SIZE);
+	if (ringOff + ringSize < ringOff || ringOff + ringSize > GLOBAL.fbMappedFullSize ||
+		replyOff + replySize < replyOff || replyOff + replySize > GLOBAL.fbMappedFullSize) {
+		lprintf("PVMAC GL ring outside the mapped VRAM, not reported\n");
+		return noErr;
+	}
+	info->ringOffset = ringOff;
+	info->ringSize = ringSize;
+	info->replyOffset = replyOff;
+	info->replySize = replySize;
+	return noErr;
+}
+
+UInt32 *QemuVga_CursorSlot(void)
+{
+	return (UInt32 *)(FB_START + GLOBAL.cursorOffset);
+}
+
+/* The 32x32 ARGB image must already be in the cursor slot. */
+Boolean QemuVga_CursorDefine(UInt32 hotX, UInt32 hotY)
+{
+	SynchronizeIO();	/* image stores before the doorbell */
+	PvmacWriteL(PVMAC_REG_CUR_SIZE, PVMAC_CURSOR_EDGE);
+	PvmacWriteL(PVMAC_REG_CUR_HOT, (hotY << 16) | (hotX & 0xffff));
+	PvmacWriteL(PVMAC_REG_CUR_DEFINE, 1);
+	return (PvmacReadL(PVMAC_REG_STATUS) & PVMAC_STATUS_ERROR) == 0;
+}
+
+/* x, y: hotspot position on screen */
+void QemuVga_CursorMove(SInt32 x, SInt32 y, Boolean visible)
+{
+	PvmacWriteL(PVMAC_REG_CUR_POS, ((UInt32)(y & 0xffff) << 16) | (x & 0xffff));
+	PvmacWriteL(PVMAC_REG_CUR_CTRL, visible ? 1 : 0);
 }
