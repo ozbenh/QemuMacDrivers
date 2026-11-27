@@ -50,3 +50,96 @@ jobs:
         with:
           name: qemu_vga.ndrv
           path: QemuVGADriver/build/qemu_vga.ndrv
+
+  # DG_LAYOUT (SHA-256 of the Mavericks gliDispatch.h) and the GL opcode
+  # numbers come from VirtualIntelMac's generator run on the 10.9 SDK, exactly
+  # as UTM/guest-kit/intel/build-mojave-kit.sh does. Runs on macOS; the Retro68
+  # job below only consumes the small generated header.
+  glhello-header:
+    runs-on: xcode-27
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch VirtualIntelMac (pinned) and the 10.9 SDK
+        env:
+          VIM_COMMIT: 2861da9e265e557aef90319e4451487ed1fed553   # VirtualIntelMac 2.2
+          SDK_URL: https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX10.9.sdk.tar.xz
+          SDK_SHA256: fcf88ce8ff0dd3248b97f4eb81c7909f2cc786725de277f4d05a2b935cc49de0
+        run: |
+          set -e
+          git clone -q --filter=blob:none --no-checkout https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon.git "$RUNNER_TEMP/vim"
+          git -C "$RUNNER_TEMP/vim" checkout -q "$VIM_COMMIT" -- Source/scripts Source/PassthroughOpenGL
+          curl -sfL -o "$RUNNER_TEMP/sdk.tar.xz" "$SDK_URL"
+          echo "$SDK_SHA256  $RUNNER_TEMP/sdk.tar.xz" | shasum -a 256 -c -
+          tar -xf "$RUNNER_TEMP/sdk.tar.xz" -C "$RUNNER_TEMP"
+
+      - name: Generate glhello_gen.h
+        run: |
+          set -e
+          python3 -I "$RUNNER_TEMP/vim/Source/scripts/generate-passthrough-opengl.py" \
+            "$RUNNER_TEMP/MacOSX10.9.sdk" "$RUNNER_TEMP/glpair" > /dev/null
+          GLHello/gen-glhello-header.sh "$RUNNER_TEMP/glpair" "$RUNNER_TEMP/glhello_gen.h"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glhello-gen-header
+          path: ${{ runner.temp }}/glhello_gen.h
+
+  glhello:
+    needs: glhello-header
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: glhello-gen-header
+          path: GLHello
+
+      # CodeFragments.h / Folders.h for the CFM probe (and InterfaceLib stubs).
+      - name: Checkout Universal Interfaces
+        uses: actions/checkout@v4
+        with:
+          repository: brunocastello/iWordle
+          ref: 7483dbeddd5d8c9d73bb362c24ad70ce5d6d7f45
+          path: sdk
+          sparse-checkout: third_party/InterfacesAndLibraries
+
+      - name: Build GLHello with Retro68 (PowerPC)
+        run: |
+          docker pull -q ghcr.io/autc04/retro68
+          docker run --rm -v "$PWD:/src" -w /src/GLHello -i ghcr.io/autc04/retro68 /bin/bash <<'EOF2'
+          set -e
+          /Retro68-build/bin/interfaces-and-libraries.sh /Retro68-build/toolchain /src/sdk/third_party/InterfacesAndLibraries
+          command -v cmake >/dev/null || { apt-get update -qq && apt-get install -y -qq cmake; }
+          TC=$(find /Retro68-build/toolchain -name retroppc.toolchain.cmake | head -1)
+          echo "toolchain file: $TC"
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_TOOLCHAIN_FILE="$TC"
+          grep -rl NewGWorld /Retro68-build/toolchain/powerpc-apple-macos/include | head -3
+          make
+          ls -l
+          chmod -R a+rwX /src/GLHello/build
+          EOF2
+
+      - name: Inspect output
+        run: |
+          ls -l GLHello/build
+          test -s GLHello/build/GLHello.bin
+          test -s GLHello/build/GLHello.dsk
+          sha256sum GLHello/build/GLHello.bin GLHello/build/GLHello.dsk
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: GLHello
+          path: |
+            GLHello/build/GLHello.bin
+            GLHello/build/GLHello.dsk
+            GLHello/glhello_gen.h
