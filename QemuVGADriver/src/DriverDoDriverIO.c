@@ -395,6 +395,7 @@ DriverControlCmd( AddressSpaceID addressSpaceID, IOCommandID ioCommandID,
 		status = GraphicsCoreSetPowerState((VDPowerStateRec *) genericPtr);
 		break;	
 	default:
+		status = controlErr;
 		break;
 	}
 	if (status)

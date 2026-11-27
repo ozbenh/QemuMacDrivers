@@ -124,6 +124,7 @@ static OSStatus VBLTimerProc(void *p1, void *p2)
 	ScheduleVBLTimer();
 
 	GLOBAL.inInterrupt = 0;
+	return noErr;
 }
 
 #ifdef USE_PCI_IRQ
@@ -383,4 +384,5 @@ OSStatus QemuVga_Blank(Boolean blank)
 		VgaWriteB(0x3c0, 0x3f);
 	}
 	GLOBAL.blanked = blank;
+	return noErr;
 }
