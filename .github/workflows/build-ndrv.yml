@@ -242,3 +242,60 @@ jobs:
         with:
           name: opengl-codegen-ppc
           path: ${{ runner.temp }}/codegen-out
+
+  # The Mac OS 9 OpenGLLibrary replacement (CFM shared library, PowerPC,
+  # Retro68): generated gl* encoders from opengl-codegen + our DG client over
+  # the PVMAC ring + AGL. Output: MacBinary 'shlb' with a cfrg resource.
+  opengl-library:
+    needs: opengl-codegen
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: opengl-codegen-ppc
+          path: codegen
+
+      - name: Generate the export wrappers
+        run: |
+          set -e
+          ls codegen codegen/ppc
+          python3 -I OpenGLLibrary/gen-gl-exports.py codegen/ppc OpenGLLibrary/gen
+          wc -l OpenGLLibrary/gen/gl_generated.c OpenGLLibrary/gen/OpenGLLibrary.exp
+
+      - name: Build OpenGLLibrary with Retro68 (PowerPC)
+        run: |
+          docker pull -q ghcr.io/autc04/retro68
+          docker run --rm -v "$PWD:/src" -w /src/OpenGLLibrary -i ghcr.io/autc04/retro68 /bin/bash <<'EOF2'
+          set -e
+          command -v cmake >/dev/null || { apt-get update -qq && apt-get install -y -qq cmake; }
+          command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }
+          TC=$(find /Retro68-build/toolchain -name retroppc.toolchain.cmake | head -1)
+          echo "toolchain file: $TC"
+          powerpc-apple-macos-gcc --version | head -1
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_TOOLCHAIN_FILE="$TC"
+          make VERBOSE=1
+          ls -l
+          chmod -R a+rwX /src/OpenGLLibrary/build /src/OpenGLLibrary/gen
+          EOF2
+
+      - name: Inspect output
+        run: |
+          set -e
+          ls -l OpenGLLibrary/build
+          python3 -I OpenGLLibrary/check-pef.py OpenGLLibrary/build/OpenGLLibrary.pef \
+            OpenGLLibrary/gen/OpenGLLibrary.exp OpenGLLibrary/build/OpenGLLibrary.bin
+          sha256sum OpenGLLibrary/build/OpenGLLibrary.bin
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenGLLibrary-os9
+          path: |
+            OpenGLLibrary/build/OpenGLLibrary.bin
+            OpenGLLibrary/build/OpenGLLibrary.dsk
+            OpenGLLibrary/build/OpenGLLibrary.pef
+            OpenGLLibrary/gen/OpenGLLibrary.exp
